@@ -158,7 +158,7 @@ body{
 /* ---------- Play zone ---------- */
 #playzone{
   flex:1;position:relative;overflow:hidden;
-  display:flex;align-items:center;justify-content:center;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;
 }
 #floaters{position:absolute;inset:0;pointer-events:none;z-index:8}
 .float{
@@ -216,22 +216,37 @@ body{
 
 /* ---------- Hand ---------- */
 #handArea{
-  flex:0 0 auto;padding:8px 10px 14px;border-top:1px solid var(--line);
+  flex:0 0 auto;padding:8px 0 14px;border-top:1px solid var(--line);
   background:linear-gradient(0deg,var(--ink-2),var(--ink));
+  position:relative;
 }
-#hand{display:flex;gap:5px;justify-content:center;align-items:flex-end;min-height:122px;width:100%}
+/* edge fades hint that the hand scrolls sideways */
+#handArea::after{
+  content:'';position:absolute;top:0;right:0;bottom:0;width:26px;pointer-events:none;
+  background:linear-gradient(90deg,transparent,var(--ink-2));z-index:2;
+}
+#hand{
+  display:flex;gap:9px;align-items:flex-end;min-height:132px;
+  overflow-x:auto;overflow-y:visible;
+  padding:14px 14px 4px;
+  scroll-snap-type:x proximity;
+  -webkit-overflow-scrolling:touch;
+  scrollbar-width:none;
+}
+#hand::-webkit-scrollbar{display:none}
 .card{
-  position:relative;flex:1 1 0;min-width:0;max-width:62px;height:100px;border-radius:var(--r);
+  position:relative;flex:0 0 auto;width:78px;height:108px;border-radius:var(--r);
   background:linear-gradient(160deg,var(--ink-3),var(--ink-2));
   border:1px solid var(--line);
   display:flex;flex-direction:column;justify-content:space-between;
-  padding:7px 6px;cursor:pointer;transition:transform .14s,box-shadow .14s,border-color .14s;
+  padding:9px 8px;cursor:pointer;transition:transform .14s,box-shadow .14s,border-color .14s;
+  scroll-snap-align:center;
 }
 .card:active{transform:translateY(2px)}
 .card.sel{transform:translateY(-14px);border-color:var(--volt);box-shadow:0 0 0 1px var(--volt),0 10px 30px -10px var(--volt)}
-.card .cval{font-size:22px;font-weight:700;line-height:1}
-.card .cop{font-size:10px;letter-spacing:.04em;color:var(--fog);font-weight:700}
-.card .ctag{font-size:7.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--fog);align-self:flex-end}
+.card .cval{font-size:27px;font-weight:700;line-height:1}
+.card .cop{font-size:11px;letter-spacing:.04em;color:var(--fog);font-weight:700}
+.card .ctag{font-size:8.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--fog);align-self:flex-end}
 .card.t-add .cval{color:var(--volt)}
 .card.t-mult .cval{color:var(--gold)}
 .card.t-wild .cval{color:var(--violet)}
@@ -348,10 +363,58 @@ body{
   12%{opacity:1}
   100%{opacity:0;transform:translate(var(--dx),var(--dy)) rotate(var(--rot)) scale(1)}
 }
+
+/* ---- best-play hint ---- */
+.hint{
+  font-size:12px;color:var(--fog);text-align:center;padding:8px 18px;margin-bottom:6px;
+  background:var(--ink-2);border:1px solid var(--line);border-radius:99px;
+  align-self:center;max-width:92%;
+}
+.hint b{color:var(--pale)}
+.hint.perfect{color:var(--volt);border-color:var(--volt)}
+
+/* ---- deck counter ---- */
+.deck-count{color:var(--fog);opacity:.75;margin-left:8px;font-size:9px;letter-spacing:.1em}
+
+/* ---- undo button ---- */
+.btn-undo{
+  flex:0 0 auto;width:52px;background:var(--ink-3);color:var(--pale);
+  border:1px solid var(--line);font-size:19px;
+}
+.btn-undo:active:not(:disabled){background:var(--ink-2)}
+
+/* ---- bigger reorder arrows ---- */
+.arr{width:30px;height:30px;font-size:17px}
+
+/* ---- tutorial coach panel ---- */
+.coach{
+  background:var(--ink-2);border:1px solid var(--volt);border-radius:14px;
+  padding:16px 18px;margin:0 16px 12px;text-align:center;align-self:center;max-width:340px;
+  box-shadow:0 0 30px -14px var(--volt);
+}
+.coach-step{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--fog);margin-bottom:6px}
+.coach-title{font-size:17px;font-weight:700;margin-bottom:6px}
+.coach-body{font-size:13px;color:var(--pale);line-height:1.55}
+.coach-body b{color:var(--white)}
+
+/* ---- share result ---- */
+.share-shape{
+  font-size:26px;letter-spacing:6px;margin:6px 0 20px;
+}
+.ov-toast{
+  position:absolute;bottom:40px;left:50%;transform:translateX(-50%) translateY(14px);
+  background:var(--ink-3);border:1px solid var(--line);color:var(--pale);
+  padding:10px 18px;border-radius:99px;font-size:12.5px;font-weight:600;
+  opacity:0;transition:.25s;pointer-events:none;white-space:nowrap;z-index:40;
+}
+.ov-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* ---- daily done state ---- */
+.menu-btn.done{opacity:.6}
 </style>
 </head>
 <body>
 <div id="app"></div>
-<script src="game.js?v=8"></script>
+<script src="game.js?v=12"></script>
 </body>
 </html>

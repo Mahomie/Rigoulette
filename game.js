@@ -44,6 +44,7 @@ function newRun(mode, resume){
     // blitz timer state
     timeLeft: 0,
     timeBuys: 0,        // times bought more time this stage (cost rises)
+    firstTry: true,     // cleared without retrying this stage?
   };
   if(mode==='daily') setDailySeed(); else setFreePlay();
   ensureAudioStarted();
@@ -66,11 +67,13 @@ function lvl(id){ return (S.upgrades && S.upgrades[id]) || 0; }
 
 /* Set up a fresh attempt at the CURRENT stage (used on start AND on retry) */
 function startStage(){
+  if(S.mode==='daily') setDailySeed(S.stage);   // same stage = same puzzle, always
   S.runScore = 0;
   S.handsLeft = 4 + lvl('reserve');
   S.discardsLeft = 3 + lvl('sift');
   S.chain = [];
   S.hand = [];
+  S.lastHint = null;
   buildDeck();
   draw();
   if(isBlitz()){
@@ -111,9 +114,11 @@ function updateTimerUI(){
   }
 }
 
+let _cardId = 0;                      // global monotonic id: never collides
+function nextCardId(){ return ++_cardId; }
+
 function buildDeck(){
   S.deck = [];
-  let id = 0;
   // base deck: weighted spread
   const spread = ['add','add','add','add','add','mult','mult','wild','wild','risk',
                   'add','add','mult','wild','add','mult'];
@@ -121,7 +126,7 @@ function buildDeck(){
     const proto = CARD_POOL.filter(c=>c.type===t)[
       Math.floor(RNG()*CARD_POOL.filter(c=>c.type===t).length)
     ];
-    S.deck.push(makeCard(proto, id++));
+    S.deck.push(makeCard(proto, nextCardId()));
   });
   shuffle(S.deck);
 }
@@ -145,15 +150,22 @@ function mulberry32(seed){
   };
 }
 let RNG = Math.random;          // free-play uses true random
-function setDailySeed(){
+/* Daily seed is UTC-based so every player worldwide gets the same puzzle
+   on the same calendar day, and cannot time-travel by changing the clock. */
+function dailySeedBase(){
   const d = new Date();
-  _seed = d.getFullYear()*10000 + (d.getMonth()+1)*100 + d.getDate();
-  RNG = mulberry32(_seed);
+  return d.getUTCFullYear()*10000 + (d.getUTCMonth()+1)*100 + d.getUTCDate();
+}
+function setDailySeed(stage){
+  _seed = dailySeedBase();
+  // reseed per stage so a given stage is ALWAYS the same puzzle for everyone,
+  // regardless of what happened before it
+  RNG = mulberry32(_seed + (stage||1)*7919);
 }
 function setFreePlay(){ RNG = Math.random; }
 function todayLabel(){
   const d = new Date();
-  return d.toLocaleDateString(undefined,{month:'short',day:'numeric'});
+  return d.toLocaleDateString(undefined,{month:'short',day:'numeric',timeZone:'UTC'});
 }
 
 function handSize(){ return 8 + lvl('wide'); }
@@ -173,11 +185,10 @@ function draw(){
 }
 
 function refillDeck(){
-  let id = Date.now()%100000;
   const spread = ['add','add','add','mult','wild','add','mult','risk','add','wild'];
   spread.forEach(t=>{
     const opts = CARD_POOL.filter(c=>c.type===t);
-    S.deck.push(makeCard(opts[Math.floor(RNG()*opts.length)], id++));
+    S.deck.push(makeCard(opts[Math.floor(RNG()*opts.length)], nextCardId()));
   });
   shuffle(S.deck);
 }
@@ -227,11 +238,12 @@ function saveStats(st){ store(STATS_KEY, st); }
 let _settings = null;
 function settings(){
   if(_settings) return _settings;
-  _settings = load(SETTINGS_KEY) || {sound:true, music:true, vibration:true};
+  _settings = load(SETTINGS_KEY) || {sound:true, music:true, vibration:true, hints:true};
   // backfill any missing keys for older saves
   if(_settings.sound===undefined) _settings.sound = true;
   if(_settings.music===undefined) _settings.music = true;
   if(_settings.vibration===undefined) _settings.vibration = true;
+  if(_settings.hints===undefined) _settings.hints = true;
   return _settings;
 }
 function setSetting(key, val){
@@ -323,6 +335,10 @@ function evaluatePlay(cards){
    ============================================================ */
 
 function render(){
+  // preserve the hand's horizontal scroll across re-renders so tapping a
+  // card doesn't snap the player back to the start of their hand
+  const prevHand = document.getElementById('hand');
+  const prevScroll = prevHand ? prevHand.scrollLeft : 0;
   const pct = Math.min(100, Math.round(S.runScore / S.target * 100));
   App.innerHTML = `
     <div id="hud">
@@ -331,7 +347,7 @@ function render(){
         <span class="round-tag">${isBlitz()?'Blitz · ':''}Stage <b>${S.stage}</b></span>
         ${isBlitz()
           ? `<span id="timerWrap" class="timer ${S.timeLeft<=10?'low':''}"><span id="timerVal">${S.timeLeft}s</span></span>`
-          : `<span class="round-tag">Best <b>${S.best}</b></span>`}
+          : `<span class="round-tag">Best <b>${loadStats().bestStage||0}</b></span>`}
       </div>
       <div class="goal-wrap">
         <div class="goal-line">
@@ -363,15 +379,17 @@ function render(){
 
     <div id="playzone">
       <div id="floaters"></div>
+      ${hintHTML()}
       ${chainTrackHTML()}
     </div>
 
     <div id="handArea">
-      <div class="hand-label">${S.chain.length?'Tap to add to the end of your chain':'Your hand'}</div>
+      <div class="hand-label">${S.chain.length?'Tap to add to the end of your chain':'Your hand'} <span class="deck-count">${S.deck.length} in deck</span></div>
       <div id="hand">${S.hand.map(cardHTML).join('')}</div>
     </div>
 
     <div id="actions">
+      <button class="btn btn-undo" id="undoBtn" ${S.chain.length===0?'disabled':''} aria-label="Undo last card">↺</button>
       <button class="btn btn-disc" id="discardBtn" ${S.discardsLeft<=0||S.chain.length===0?'disabled':''}>
         Discard <small>${S.discardsLeft} left</small>
       </button>
@@ -385,7 +403,11 @@ function render(){
   `;
   bindHand();
   bindChain();
+  const newHand = document.getElementById('hand');
+  if(newHand && prevScroll) newHand.scrollLeft = prevScroll;
   document.getElementById('playBtn').onclick = playChain;
+  const undoBtn = document.getElementById('undoBtn');
+  if(undoBtn) undoBtn.onclick = ()=>{ if(S.chain.length){ S.chain.pop(); render(); } };
   document.getElementById('discardBtn').onclick = discardSelected;
   document.getElementById('homeBtn').onclick = goHome;
 }
@@ -403,7 +425,11 @@ function goHome(){
     <button class="big-btn" id="goHomeYes">Home</button>
     <button class="big-btn ghost" id="goHomeNo">Keep playing</button>
   `);
-  document.getElementById('goHomeYes').onclick = ()=>{ stopTimer(); persistRun(); startScreen(); };
+  document.getElementById('goHomeYes').onclick = ()=>{
+    stopTimer();
+    if(S.mode==='daily'){ dailyResult(false); return; }   // show their daily result
+    persistRun(); startScreen();
+  };
   document.getElementById('goHomeNo').onclick = ()=>{ hideOverlay(); if(isBlitz()) startTimer(); render(); };
 }
 
@@ -416,8 +442,21 @@ function effDisp(c){
   return '+'+(c.val+amp);   // add & wild
 }
 
+
+/* teaching feedback: how the last hand compared to the best available */
+function hintHTML(){
+  const h = S.lastHint;
+  if(!h || !settings().hints) return '';
+  if(h.perfect){
+    return `<div class="hint perfect">✓ Perfect — that was the best play available</div>`;
+  }
+  const pct = Math.round(h.got / h.best * 100);
+  return `<div class="hint">Best possible that hand: <b>${h.best}</b> · you got <b>${h.got}</b> (${pct}%)</div>`;
+}
+
 function chainTrackHTML(){
   if(S.chain.length===0){
+    if(S.mode==='tutorial') return '';
     return `<div class="zone-hint">Tap cards below to build a chain.<br>It scores <b>left to right</b> — order changes everything.<br><br><b>+</b> base · <b>×</b> multiply · <b>±</b> both · <b>!</b> gamble</div>`;
   }
   const cards = chainCards();
@@ -494,8 +533,10 @@ function hasMultSelected(){ return chainCards().some(c=>c.type==='mult'||c.type=
 
 function playChain(){
   if(S.chain.length===0) return;
+  if(S.mode==='tutorial'){ tutorialPlay(); return; }
   const cards = selectedCards();
   const res = evaluatePlay(cards);
+  const handSnapshot = S.hand.slice();   // for the "best possible" hint
 
   // animate floaters for each step
   let delay = 0;
@@ -520,11 +561,22 @@ function playChain(){
     S.handsLeft--;
     S.chain = [];
     // track best single chain for stats
-    if(res.total > (S.runStats.bestChain||0)) S.runStats.bestChain = res.total;
+    if(res.total > (S.runStats.bestChain||0)){
+      S.runStats.bestChain = res.total;
+      S.runStats.bestShape = cards.map(c=>c.type);   // for the share card
+    }
+    S.runStats.hands = (S.runStats.hands||0) + 1;
     // remove played cards, draw back up
     S.hand = S.hand.filter(c=>!cards.includes(c));
     draw();
     countUp(res.total);
+    // teaching hint: how close was this to the best possible play?
+    try{
+      const bp = bestPossible(handSnapshot, 5);
+      S.lastHint = (bp.total > res.total)
+        ? {best:bp.total, got:res.total, perfect:false}
+        : {best:res.total, got:res.total, perfect:true};
+    }catch(e){ S.lastHint = null; }
     saveBest(Math.max(S.runScore, S.best));
     S.best = loadBest();
 
@@ -709,6 +761,166 @@ function ensureAudioStarted(){
   if(settings().music && !_music.on) startMusic();
 }
 
+
+
+/* ============================================================
+   TUTORIAL — interactive first run.
+   Three scripted hands, each teaching exactly one idea, played
+   with the real UI so the lesson transfers directly.
+   ============================================================ */
+const TUT_KEY = 'chain_tutorial_v1';
+function tutorialDone(){ return !!load(TUT_KEY); }
+function markTutorialDone(){ store(TUT_KEY, {done:true, at:Date.now()}); }
+
+const TUT_STEPS = [
+  {
+    title: 'Cards add up',
+    body: 'Tap the two <b style="color:var(--volt)">+</b> cards to put them in your chain, then play it.',
+    cards: [{type:'add',op:'+',val:8},{type:'add',op:'+',val:6}],
+    target: 14,
+    check: (res)=> res.total >= 14,
+    lesson: 'Simple: + cards add to your total.'
+  },
+  {
+    title: 'Order changes everything',
+    body: 'Now you have a <b style="color:var(--gold)">×2</b>. Put the <b>+10 first</b>, then the ×2. It scores left to right.',
+    cards: [{type:'add',op:'+',val:10},{type:'mult',op:'×',val:2}],
+    target: 20,
+    check: (res)=> res.total >= 20,
+    lesson: '+10 then ×2 = 20. But ×2 then +10 = only 10. Adds first, then multiply.'
+  },
+  {
+    title: 'Risk needs a multiplier',
+    body: 'The <b style="color:var(--rose)">!</b> card pays double — but only if a <b style="color:var(--gold)">×</b> comes before it. Order: +6, ×3, then !10.',
+    cards: [{type:'add',op:'+',val:6},{type:'mult',op:'×',val:3},{type:'risk',op:'!',val:10}],
+    target: 38,
+    check: (res)=> res.total >= 38,
+    lesson: 'Place ! after a × and it pays double. Before it, it fizzles.'
+  }
+];
+
+let TUT = null;
+
+function startTutorial(){
+  TUT = { step:0 };
+  ensureAudioStarted();
+  S = {
+    mode:'tutorial', stage:1, target:TUT_STEPS[0].target, runScore:0, coins:0,
+    handsLeft:1, discardsLeft:0, deck:[], hand:[], chain:[],
+    upgrades:{}, runStats:{stagesCleared:0,bestChain:0}, best:0,
+    timeLeft:0, timeBuys:0, firstTry:true, lastHint:null
+  };
+  setFreePlay();
+  loadTutStep();
+}
+
+function loadTutStep(){
+  const st = TUT_STEPS[TUT.step];
+  S.target = st.target;
+  S.runScore = 0;
+  S.chain = [];
+  S.handsLeft = 1;
+  S.discardsLeft = 0;
+  S.lastHint = null;
+  S.hand = st.cards.map((c,i)=>({id:9000+TUT.step*10+i, type:c.type, op:c.op, tag:c.type, val:c.val}));
+  S.deck = [];
+  renderTutorial();
+}
+
+function renderTutorial(){
+  render();
+  const st = TUT_STEPS[TUT.step];
+  // coach panel sits in the play zone
+  const pz = document.getElementById('playzone');
+  if(pz){
+    const coach = document.createElement('div');
+    coach.className = 'coach';
+    coach.innerHTML = `
+      <div class="coach-step">Step ${TUT.step+1} of ${TUT_STEPS.length}</div>
+      <div class="coach-title">${st.title}</div>
+      <div class="coach-body">${st.body}</div>`;
+    pz.insertBefore(coach, pz.firstChild.nextSibling);
+  }
+  // hide the Home button during tutorial to keep focus, add a skip
+  const hb = document.getElementById('homeBtn');
+  if(hb){ hb.textContent = 'Skip'; hb.onclick = ()=>{ markTutorialDone(); TUT=null; startScreen(); }; }
+}
+
+function tutorialPlay(){
+  const cards = selectedCards();
+  if(cards.length===0) return;
+  const res = evaluatePlay(cards);
+  const st = TUT_STEPS[TUT.step];
+  if(st.check(res)){
+    celebrate();
+    setTimeout(()=>{
+      showOverlay(`
+        <div class="ov-eyebrow">Nice</div>
+        <div class="ov-title" style="font-size:26px">${res.total} points</div>
+        <div class="ov-sub">${st.lesson}</div>
+        <button class="big-btn" id="tutNext">${TUT.step < TUT_STEPS.length-1 ? 'Next lesson →' : 'Start playing →'}</button>
+      `);
+      document.getElementById('tutNext').onclick = ()=>{
+        hideOverlay();
+        TUT.step++;
+        if(TUT.step >= TUT_STEPS.length){
+          markTutorialDone(); TUT=null;
+          newRun('free'); render();
+        } else {
+          loadTutStep();
+        }
+      };
+    }, 500);
+  } else {
+    // gentle correction, let them try again
+    S.chain = [];
+    toast(`That scored ${res.total} — aim for ${st.target}. Try the order in the tip.`);
+    renderTutorial();
+  }
+}
+
+/* ============================================================
+   SOLVER — what was the best possible play from this hand?
+   Powers the "best possible" teaching hint. Brute-forces all
+   subsets up to 5 cards and all orderings of each, which is
+   small enough to be instant (and cached per hand).
+   ============================================================ */
+function bestPossible(hand, maxLen){
+  maxLen = Math.min(maxLen||5, 5);
+  let best = {total:0, cards:[]};
+  // PRUNE: brute force blows up past ~9 cards. Multipliers and wilds are
+  // pivotal so keep them all; for adds/risks only the highest values can
+  // ever be part of an optimal chain, so keep the top few.
+  const pivotal = hand.filter(c=>c.type==='mult'||c.type==='wild');
+  const rest = hand.filter(c=>c.type==='add'||c.type==='risk')
+                   .sort((a,b)=>b.val-a.val)
+                   .slice(0, Math.max(2, 9 - pivotal.length));
+  hand = pivotal.concat(rest).slice(0, 9);
+  const n = hand.length;
+  // iterate all subsets via bitmask, then permute the small ones
+  for(let mask=1; mask < (1<<n); mask++){
+    let subset = [];
+    for(let i=0;i<n;i++) if(mask & (1<<i)) subset.push(hand[i]);
+    if(subset.length > maxLen) continue;
+    permuteScore(subset, [], best);
+  }
+  return best;
+}
+function permuteScore(remaining, current, best){
+  if(remaining.length === 0){
+    if(current.length === 0) return;
+    const t = evaluatePlay(current).total;
+    if(t > best.total){ best.total = t; best.cards = current.slice(); }
+    return;
+  }
+  for(let i=0;i<remaining.length;i++){
+    const next = remaining.slice(0,i).concat(remaining.slice(i+1));
+    current.push(remaining[i]);
+    permuteScore(next, current, best);
+    current.pop();
+  }
+}
+
 /* ============================================================
    STAGE FLOW + SHOP  (level-based: fail = retry this stage)
    ============================================================ */
@@ -717,16 +929,12 @@ function stageWin(){
   const reward = coinsForStage(S.stage, S.runScore, S.target);
   S.coins += reward;
   S.runStats.stagesCleared++;
+  if(S.firstTry !== false) S.runStats.firstTryClears = (S.runStats.firstTryClears||0)+1;
   // lifetime stats
   const st = loadStats();
-  st.runs = st.runs || 0;
-  st.stagesCleared = Math.max(st.stagesCleared||0, (st.stagesCleared||0)+1);
+  st.stagesCleared = (st.stagesCleared||0) + 1;
   if(S.runStats.bestChain > (st.bestChain||0)) st.bestChain = S.runStats.bestChain;
-  if(S.mode==='daily'){
-    const key = ''+_seed;
-    st.dailyBest = st.dailyBest||{};
-    st.dailyBest[key] = Math.max(st.dailyBest[key]||0, S.runScore);
-  }
+  if(S.stage > (st.bestStage||0)) st.bestStage = S.stage;   // the meaningful "best"
   saveStats(st);
   persistRun();
   celebrate();                 // confetti + chime + haptic on the play screen
@@ -741,10 +949,14 @@ function stageWin(){
         <div class="s"><div class="n">${S.handsLeft}</div><div class="l">Hands left</div></div>
       </div>
       <button class="big-btn" id="toNext">Next stage →</button>
-      <button class="big-btn ghost" id="toShop">Visit shop · ${S.coins}c</button>
+      ${S.mode==='daily' ? '<button class="big-btn ghost" id="toEnd">End & share result</button>'
+                         : '<button class="big-btn ghost" id="toShop">Visit shop · '+S.coins+'c</button>'}
     `);
     document.getElementById('toNext').onclick = ()=>{ nextStage(); hideOverlay(); render(); };
-    document.getElementById('toShop').onclick = ()=>openShop(false);
+    const shopBtn = document.getElementById('toShop');
+    if(shopBtn) shopBtn.onclick = ()=>openShop(false);
+    const endBtn = document.getElementById('toEnd');
+    if(endBtn) endBtn.onclick = ()=>dailyResult(true);
   }, 550);
 }
 
@@ -775,10 +987,93 @@ function timeUp(){
     startTimer();
     render();
   };
-  document.getElementById('retryTime').onclick = ()=>{ startStage(); hideOverlay(); render(); };
+  document.getElementById('retryTime').onclick = ()=>{ S.firstTry=false; startStage(); hideOverlay(); render(); };
+}
+
+/* ---- Daily: one attempt, then a shareable result ---- */
+const TYPE_EMOJI = {add:'🟩', mult:'🟨', wild:'🟪', risk:'🟥'};
+
+function dailyShareText(){
+  const st = S.runStats || {};
+  const shape = (st.bestShape||[]).map(t=>TYPE_EMOJI[t]||'⬜').join('');
+  const lines = [
+    `CHAIN — Daily ${todayLabel()}`,
+    `Stage ${S.stage} · best chain ${st.bestChain||0}`,
+    shape || '',
+    'Play: ' + (location.origin && location.origin!=='null' ? location.origin+location.pathname : 'chain game')
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+function dailyResult(cleared){
+  stopTimer();
+  const st = loadStats();
+  const key = ''+dailySeedBase();
+  st.dailyBest = st.dailyBest||{};
+  st.dailyBest[key] = Math.max(st.dailyBest[key]||0, S.stage);
+  if((S.runStats.bestChain||0) > (st.bestChain||0)) st.bestChain = S.runStats.bestChain;
+  if(S.stage > (st.bestStage||0)) st.bestStage = S.stage;
+  saveStats(st);
+  const shape = (S.runStats.bestShape||[]).map(t=>TYPE_EMOJI[t]||'⬜').join(' ');
+  showOverlay(`
+    <div class="ov-eyebrow">Daily · ${todayLabel()}</div>
+    <div class="ov-title" style="font-size:28px">${cleared?'Daily complete':'Run over'}</div>
+    <div class="ov-sub">One attempt a day — everyone gets the same puzzle. Come back tomorrow for a new one.</div>
+    <div class="stat-line">
+      <div class="s"><div class="n" style="color:var(--volt)">${S.stage}</div><div class="l">Stage reached</div></div>
+      <div class="s"><div class="n" style="color:var(--gold)">${S.runStats.bestChain||0}</div><div class="l">Best chain</div></div>
+      <div class="s"><div class="n">${S.runStats.hands||0}</div><div class="l">Hands</div></div>
+    </div>
+    ${shape?`<div class="share-shape">${shape}</div>`:''}
+    <button class="big-btn" id="shareBtn">Share result</button>
+    <button class="big-btn ghost" id="dailyHome">Home</button>
+  `);
+  document.getElementById('shareBtn').onclick = shareDaily;
+  document.getElementById('dailyHome').onclick = startScreen;
+}
+
+function shareDaily(){
+  const text = dailyShareText();
+  if(navigator.share){
+    navigator.share({text}).catch(()=>copyShare(text));
+  } else {
+    copyShare(text);
+  }
+}
+function copyShare(text){
+  try{
+    navigator.clipboard.writeText(text).then(
+      ()=>toastOverlay('Copied — paste it anywhere'),
+      ()=>fallbackCopy(text)
+    );
+  }catch(e){ fallbackCopy(text); }
+}
+function fallbackCopy(text){
+  try{
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+    toastOverlay('Copied — paste it anywhere');
+  }catch(e){ toastOverlay('Copy not supported here'); }
+}
+// a toast that works while an overlay is covering the screen
+function toastOverlay(msg){
+  const ov = document.getElementById('overlay');
+  if(!ov) { toast(msg); return; }
+  let t = document.getElementById('ovToast');
+  if(!t){
+    t = document.createElement('div');
+    t.id = 'ovToast'; t.className='ov-toast';
+    ov.appendChild(t);
+  }
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(window.__ovtt);
+  window.__ovtt = setTimeout(()=>t.classList.remove('show'), 1600);
 }
 
 function stageLose(){
+  if(S.mode==='daily'){ dailyResult(false); return; }   // Daily = one attempt only
   // LEVEL-BASED: you don't lose the run — you retry THIS stage.
   showOverlay(`
     <div class="ov-eyebrow">Stage ${S.stage}</div>
@@ -792,7 +1087,7 @@ function stageLose(){
     <button class="big-btn" id="retry">Retry stage ${S.stage}</button>
     ${S.coins>0?'<button class="big-btn ghost" id="shopFirst">Shop first</button>':''}
   `);
-  document.getElementById('retry').onclick = ()=>{ startStage(); hideOverlay(); render(); };
+  document.getElementById('retry').onclick = ()=>{ S.firstTry=false; startStage(); hideOverlay(); render(); };
   const sf = document.getElementById('shopFirst');
   if(sf) sf.onclick = ()=>openShop(true);
 }
@@ -863,7 +1158,7 @@ function openShop(retryAfter){
     };
   });
   document.getElementById('shopNext').onclick = ()=>{
-    if(retryAfter){ startStage(); }
+    if(retryAfter){ S.firstTry=false; startStage(); }
     else { nextStage(); }
     hideOverlay(); render();
   };
@@ -872,6 +1167,7 @@ function openShop(retryAfter){
 function nextStage(){
   S.stage++;
   S.target = targetForStage(S.stage);
+  S.firstTry = true;          // a fresh stage: clearing now counts as first-try
   startStage();
 }
 
@@ -895,19 +1191,31 @@ function hideOverlay(){
 /* ============================================================
    START SCREEN
    ============================================================ */
+function dailyPlayedToday(){
+  const st = loadStats();
+  return !!(st.dailyBest && st.dailyBest[''+dailySeedBase()]);
+}
+function dailyStageToday(){
+  const st = loadStats();
+  return (st.dailyBest && st.dailyBest[''+dailySeedBase()]) || 0;
+}
+
 function startScreen(){
   stopTimer();   // ensure no blitz clock keeps ticking on the home screen
   const resumeFree = hasSavedRun('free');
   const savedFree = resumeFree ? load(SAVE_KEY) : null;
   const resumeBlitz = hasSavedRun('blitz');
+  const donetoday = dailyPlayedToday();
+  const firstTime = !tutorialDone();
   const savedBlitz = resumeBlitz ? load(BLITZ_KEY) : null;
   App.innerHTML = `<div class="overlay show" id="overlay" style="background:var(--ink)">
     <div class="ov-eyebrow">a combo roguelite</div>
     <div class="ov-title" style="font-size:54px;letter-spacing:-.03em">CHAIN</div>
     <div class="ov-sub">Arrange cards into a sequence. It scores <b>left to right</b>, so the order is the whole puzzle.</div>
     <div class="menu-btns">
+      ${firstTime ? `<button class="menu-btn primary" id="tutorial"><span class="mb-title">How to play</span><span class="mb-sub">Learn in 3 quick hands</span></button>` : ''}
       ${resumeFree ? `<button class="menu-btn primary" id="resume"><span class="mb-title">Continue</span><span class="mb-sub">Free play · Stage ${savedFree.stage}</span></button>` : ''}
-      <button class="menu-btn ${resumeFree?'':'primary'}" id="daily"><span class="mb-title">Daily challenge</span><span class="mb-sub">${todayLabel()} · same shuffle for everyone</span></button>
+      <button class="menu-btn ${resumeFree||donetoday||firstTime?'':'primary'} ${donetoday?'done':''}" id="daily"><span class="mb-title">Daily challenge</span><span class="mb-sub">${donetoday? 'Done today · reached stage '+dailyStageToday() : todayLabel()+' · one attempt, same for everyone'}</span></button>
       <button class="menu-btn" id="play"><span class="mb-title">${resumeFree?'New free run':'Free play'}</span><span class="mb-sub">Endless · think it through</span></button>
       <button class="menu-btn" id="blitz"><span class="mb-title">⏱ Blitz mode</span><span class="mb-sub">${resumeBlitz?'Continue · Stage '+savedBlitz.stage:'Race the clock each stage'}</span></button>
     </div>
@@ -929,7 +1237,21 @@ function startScreen(){
   if(resumeFree){
     document.getElementById('resume').onclick = ()=>{ newRun('free', true); render(); };
   }
-  document.getElementById('daily').onclick = ()=>{ newRun('daily'); render(); };
+  const tutBtn = document.getElementById('tutorial');
+  if(tutBtn) tutBtn.onclick = ()=>{ startTutorial(); };
+  document.getElementById('daily').onclick = ()=>{
+    if(donetoday){
+      showOverlay(`
+        <div class="ov-eyebrow">Daily · ${todayLabel()}</div>
+        <div class="ov-title" style="font-size:26px">Already played</div>
+        <div class="ov-sub">You reached <b>stage ${dailyStageToday()}</b> on today's puzzle.<br>One attempt per day — a new puzzle unlocks tomorrow.</div>
+        <button class="big-btn" id="dailyOk">Back</button>
+      `);
+      document.getElementById('dailyOk').onclick = startScreen;
+      return;
+    }
+    newRun('daily'); render();
+  };
   document.getElementById('play').onclick = ()=>{
     if(resumeFree){
       showOverlay(`
@@ -949,7 +1271,17 @@ function startScreen(){
   };
   document.getElementById('stats').onclick = statsScreen;
   document.getElementById('settings').onclick = settingsScreen;
-  document.getElementById('how').onclick = howScreen;
+  document.getElementById('how').onclick = ()=>{
+    showOverlay(`
+      <div class="ov-eyebrow">Learn</div>
+      <div class="ov-title" style="font-size:26px">How to play</div>
+      <div class="ov-sub">Run the 3-hand walkthrough, or read the full rules.</div>
+      <button class="big-btn" id="runTut">Play the walkthrough</button>
+      <button class="big-btn ghost" id="readRules">Read the rules</button>
+    `);
+    document.getElementById('runTut').onclick = ()=>{ startTutorial(); };
+    document.getElementById('readRules').onclick = howScreen;
+  };
 }
 
 function settingsScreen(){
@@ -971,6 +1303,7 @@ function settingsScreen(){
       ${row('music','Music','Subtle background soundtrack')}
       ${row('sound','Sound effects','Chimes and feedback tones')}
       ${row('vibration','Vibration','Haptic buzz on milestones')}
+      ${row('hints','Best-play hints','Show the best score that hand allowed')}
     </div>
     ${!LS_OK ? `<div class="ov-sub" style="font-size:12px;color:var(--fog);margin-top:6px">Settings save fully when the game runs as its own file.</div>`:''}
     <button class="big-btn" id="setBack">Back</button>
@@ -999,7 +1332,7 @@ function statsScreen(){
     <div class="ov-eyebrow">Your numbers</div>
     <div class="ov-title" style="font-size:28px;margin-bottom:20px">Stats</div>
     <div class="stats-grid">
-      <div class="stat-box"><div class="sb-n" style="color:var(--volt)">${st.best||0}</div><div class="sb-l">Best stage score</div></div>
+      <div class="stat-box"><div class="sb-n" style="color:var(--volt)">${st.bestStage||0}</div><div class="sb-l">Best stage reached</div></div>
       <div class="stat-box"><div class="sb-n" style="color:var(--gold)">${st.bestChain||0}</div><div class="sb-l">Best single chain</div></div>
       <div class="stat-box"><div class="sb-n">${st.stagesCleared||0}</div><div class="sb-l">Stages cleared</div></div>
       <div class="stat-box"><div class="sb-n" style="color:var(--violet)">${dailyCount}</div><div class="sb-l">Dailies played</div></div>
